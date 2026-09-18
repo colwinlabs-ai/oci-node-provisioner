@@ -1,0 +1,343 @@
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..ec22272
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,18 @@
++# Copy this file to `.env` for LOCAL testing only.
++# In GitHub Actions these are injected as repository Secrets instead —
++# never commit a real .env file (it's already covered by .gitignore).
++
++OCI_USER_ID=ocid1.user.oc1..xxxxxxxx
++OCI_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
++OCI_FINGERPRINT=xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx
++OCI_TENANCY_ID=ocid1.tenancy.oc1..xxxxxxxx
++OCI_REGION=us-phoenix-1
++OCI_SUBNET_ID=ocid1.subnet.oc1.phx.xxxxxxxx
++OCI_IMAGE_ID=ocid1.image.oc1.phx.aaaaaaaagrsiqy75p2vblxtrqn7ttjyafrzronnu7sfaibu6pfz6y2beeb2q
++OCI_PUBLIC_SSH_KEY="ssh-ed25519 AAAA... your-key-comment"
++
++# Optional tuning (defaults shown) — keep OCI_MAX_ATTEMPTS * OCI_RETRY_DELAY_SECONDS
++# comfortably under the cron interval in .github/workflows/oci_spawn.yml (5 min)
++# so scheduled runs never overlap.
++OCI_MAX_ATTEMPTS=4
++OCI_RETRY_DELAY_SECONDS=60
+diff --git a/.github/workflows/oci_spawn.yml b/.github/workflows/oci_spawn.yml
+index e035dea..5f81944 100644
+--- a/.github/workflows/oci_spawn.yml
++++ b/.github/workflows/oci_spawn.yml
+@@ -4,9 +4,23 @@ on:
+     - cron: '*/5 * * * *'  # Runs every 5 minutes automatically
+   workflow_dispatch:       # Allows manual execution triggers
+ 
++# CRITICAL: without this, a run that takes longer than 5 minutes overlaps
++# with the next scheduled trigger. Multiple concurrent runs hammer the OCI
++# API in parallel and, in the rare case two succeed near-simultaneously,
++# can launch more than one A1.Flex instance and blow past the Always Free
++# quota. `cancel-in-progress: false` means new triggers QUEUE instead of
++# running in parallel — at most one bot.py process runs at a time.
++concurrency:
++  group: oci-provisioner
++  cancel-in-progress: false
++
++permissions:
++  contents: read   # this workflow only reads the repo; no write access needed
++
+ jobs:
+   attempt-build:
+     runs-on: ubuntu-latest
++    timeout-minutes: 10   # safety net in case the OCI SDK ever hangs
+     steps:
+       - name: Check out repository code
+         uses: actions/checkout@v4
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..7ea550f
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,12 @@
++# Secrets / local config — NEVER commit real credentials
++.env
++.env.*
++!.env.example
++*.pem
++*.key
++
++# Python
++__pycache__/
++*.pyc
++.venv/
++venv/
+diff --git a/Ampere 24 ram 4 cpu/bot.py b/Ampere 24 ram 4 cpu/bot.py
+index 4ba2e9f..eebbeca 100644
+--- a/Ampere 24 ram 4 cpu/bot.py	
++++ b/Ampere 24 ram 4 cpu/bot.py	
+@@ -1,17 +1,37 @@
+ import oci
+ import os
++import sys
+ import time
+ from dotenv import load_dotenv
+ 
+ load_dotenv()
+ 
+-# Setup configuration from environment variables
++# ---------------------------------------------------------------------------
++# 1. Validate ALL required environment variables up front.
++#    Failing fast with a clear message beats a cryptic SDK stack trace.
++# ---------------------------------------------------------------------------
++REQUIRED_VARS = [
++    "OCI_USER_ID",
++    "OCI_PRIVATE_KEY",
++    "OCI_FINGERPRINT",
++    "OCI_TENANCY_ID",
++    "OCI_REGION",
++    "OCI_SUBNET_ID",
++    "OCI_IMAGE_ID",
++    "OCI_PUBLIC_SSH_KEY",
++]
++
++missing = [name for name in REQUIRED_VARS if not os.getenv(name, "").strip()]
++if missing:
++    print(f"CRITICAL ERROR: Missing/empty required secrets: {', '.join(missing)}")
++    sys.exit(1)
++
+ config = {
+     "user": os.getenv("OCI_USER_ID"),
+     "key_content": os.getenv("OCI_PRIVATE_KEY"),
+     "fingerprint": os.getenv("OCI_FINGERPRINT"),
+     "tenancy": os.getenv("OCI_TENANCY_ID"),
+-    "region": os.getenv("OCI_REGION")
++    "region": os.getenv("OCI_REGION"),
+ }
+ 
+ try:
+@@ -19,31 +39,63 @@ try:
+     print("OCI Authentication Successful. Initializing loop sequence...")
+ except Exception as e:
+     print(f"Authentication Failed: {e}")
+-    exit(1)
++    sys.exit(1)
+ 
+ # Execution parameters
+ compartment_id = os.getenv("OCI_TENANCY_ID")
+ subnet_id = os.getenv("OCI_SUBNET_ID")
+ image_id = os.getenv("OCI_IMAGE_ID")
+-public_ssh_key = os.getenv("OCI_PUBLIC_SSH_KEY") 
++public_ssh_key = os.getenv("OCI_PUBLIC_SSH_KEY").strip()
+ 
+-# SAFETY CHECK: Verify the key actually loaded from GitHub Secrets
+-if not public_ssh_key or public_ssh_key.strip() == "":
+-    print("CRITICAL ERROR: OCI_PUBLIC_SSH_KEY is empty or missing from your secrets!")
+-    exit(1)
++DISPLAY_NAME = "FX-Backend-Server"
+ 
+ # Availability Domains to cycle through
+ ads = ["uufj:PHX-AD-1", "uufj:PHX-AD-2", "uufj:PHX-AD-3"]
+ 
+-total_attempts = 60 
++# NOTE: keep total runtime comfortably under the cron interval (5 min) so
++# scheduled runs don't overlap. 4 attempts * 60s sleep ~= 4 min worst case.
++# Override with OCI_MAX_ATTEMPTS / OCI_RETRY_DELAY_SECONDS if you change the
++# cron schedule in oci_spawn.yml.
++total_attempts = int(os.getenv("OCI_MAX_ATTEMPTS", "4"))
++retry_delay_seconds = int(os.getenv("OCI_RETRY_DELAY_SECONDS", "60"))
++
++
++def instance_already_exists() -> bool:
++    """
++    Guard against launching a duplicate instance. This matters because the
++    GitHub Actions schedule can occasionally overlap runs (see concurrency
++    note in oci_spawn.yml) — this check is a second line of defense so we
++    never launch two Ampere A1 instances and blow past the Always Free quota.
++    """
++    try:
++        instances = oci.pagination.list_call_get_all_results(
++            compute_client.list_instances,
++            compartment_id=compartment_id,
++            display_name=DISPLAY_NAME,
++        ).data
++        active = [
++            i for i in instances
++            if i.lifecycle_state in ("PROVISIONING", "RUNNING", "STARTING")
++        ]
++        return len(active) > 0
++    except oci.exceptions.ServiceError as e:
++        # If we can't verify, fail safe by NOT blocking the run — but log it
++        # loudly so it's visible in the Actions log.
++        print(f"-> WARNING: Could not check for existing instances ({e.message}). Proceeding cautiously.")
++        return False
++
++
++if instance_already_exists():
++    print(f"Instance '{DISPLAY_NAME}' already exists and is active. Nothing to do. Exiting.")
++    sys.exit(0)
+ 
+ for i in range(1, total_attempts + 1):
+     current_ad = ads[(i - 1) % len(ads)]
+     print(f"[Attempt {i}/{total_attempts}] Requesting instance in {current_ad}...")
+-    
++
+     try:
+         request = oci.core.models.LaunchInstanceDetails(
+-            display_name="FX-Backend-Server",
++            display_name=DISPLAY_NAME,
+             compartment_id=compartment_id,
+             availability_domain=current_ad,
+             shape="VM.Standard.A1.Flex",
+@@ -63,20 +115,29 @@ for i in range(1, total_attempts + 1):
+                 display_name="forexalertsvnic"
+             ),
+             metadata={
+-                "ssh_authorized_keys": str(public_ssh_key).strip()
++                "ssh_authorized_keys": public_ssh_key
+             }
+         )
+-        
++
+         response = compute_client.launch_instance(request)
+         if response.status == 200:
+-            print("SUCCESS! Authorized Server creation initialized perfectly.")
+-            exit(0)
+-            
++            print("SUCCESS! Instance creation initialized. Exiting.")
++            sys.exit(0)
++
+     except oci.exceptions.ServiceError as e:
+-        if "Out of host capacity" in str(e) or e.status == 500:
+-            print(f"-> Capacity Unavailable. Resting 60 seconds...")
++        if "Out of host capacity" in str(e) or e.status in (500, 429):
++            print(f"-> Capacity/rate-limit issue ({e.status}). Resting {retry_delay_seconds}s...")
+         else:
+-            print(f"-> API Error: {e.message}")
+-            
++            print(f"-> API Error [{e.status}]: {e.message}")
++    except (oci.exceptions.ConnectTimeout, oci.exceptions.RequestException) as e:
++        print(f"-> Network/transport error: {e}. Resting {retry_delay_seconds}s...")
++    except Exception as e:
++        # Catch-all so an unexpected error doesn't burn the remaining
++        # attempts of this run silently.
++        print(f"-> Unexpected error: {e}. Resting {retry_delay_seconds}s...")
++
+     if i < total_attempts:
+-        time.sleep(60)
++        time.sleep(retry_delay_seconds)
++
++print("Attempts exhausted for this run. The next scheduled run will retry.")
++sys.exit(0)
+diff --git a/README.md b/README.md
+index ed57bce..df8bcc8 100644
+--- a/README.md
++++ b/README.md
+@@ -1,21 +1,94 @@
+ # OCI Ampere A1 Node Provisioner
+ 
+-An automated, lightweight Python and GitHub Actions engine designed to continuously request and provision an 
+-**Oracle Cloud Infrastructure (OCI) Always Free Ampere A1 Compute Instance** (`VM.Standard.A1.Flex` with 4 vCPUs and 24 GB RAM) 
++An automated, lightweight Python and GitHub Actions engine designed to continuously request and provision an
++**Oracle Cloud Infrastructure (OCI) Always Free Ampere A1 Compute Instance** (`VM.Standard.A1.Flex` with 4 vCPUs and 24 GB RAM)
+ across multiple Availability Domains.
+ 
++OCI's Always Free A1 capacity is frequently exhausted ("Out of host capacity"). This bot retries on a
++schedule via GitHub Actions until an instance successfully launches, then stops.
++
+ ---
+ 
+ ## Default Image Details
+ 
+ This repository is configured to deploy **Ubuntu 24.04 LTS (aarch64)**.
+ 
+-* **Region:** `us-phoenix-1` (Phoenix) - you can change your region to whichever you like
++- **Region:** `us-phoenix-1` (Phoenix) — you can change your region to whichever you like
++- **Architecture:** ARM64 (`aarch64`)
++- **OS:** Canonical Ubuntu Server 24.04 LTS
++- **Default Image OCID:**
++  ```text
++  ocid1.image.oc1.phx.aaaaaaaagrsiqy75p2vblxtrqn7ttjyafrzronnu7sfaibu6pfz6y2beeb2q
++  ```
++  If you deploy to a different region, this OCID is invalid — get the correct one for your region and
++  shape from **Compute > Images** in the OCI Console.
+ 
+-* **Architecture:** ARM64 (`aarch64`)
++---
+ 
+-* **OS:** Canonical Ubuntu Server 24.04 LTS
++## How it works
+ 
+-* **Default Image OCID:**
+-  ```text
+-  ocid1.image.oc1.phx.aaaaaaaagrsiqy75p2vblxtrqn7ttjyafrzronnu7sfaibu6pfz6y2beeb2q
++- `.github/workflows/oci_spawn.yml` runs `Ampere 24 ram 4 cpu/bot.py` every 5 minutes (and on manual dispatch).
++- The `concurrency` block in that workflow ensures only **one** run executes at a time — new triggers queue
++  instead of overlapping. This is intentional: without it, a slow run could still be in progress when the
++  next cron trigger fires, risking duplicate instance launches.
++- `bot.py` first checks whether an instance named `FX-Backend-Server` already exists and is active; if so it
++  exits immediately (idempotent — safe to leave the schedule running forever).
++- Otherwise it cycles through `PHX-AD-1`, `PHX-AD-2`, `PHX-AD-3`, retrying a small number of times per run
++  (default 4 attempts, 60s apart) so each run finishes comfortably before the next is due.
++- On success it exits `0`. On repeated "out of capacity" it also exits `0` (this is expected, not a failure)
++  — the next scheduled run will simply try again.
++
++---
++
++## Setup
++
++### 1. Prerequisites in your OCI tenancy
++
++- An OCI account/tenancy with Always Free A1 quota available in your chosen region.
++- A **VCN + public subnet** already created (note its OCID).
++- An SSH key pair you control (used to log into the instance once it's up).
++- An OCI **API signing key** for a user with permission to launch compute instances
++  (Console → Profile → API Keys → Add API Key). Note the fingerprint and download the private key.
++
++### 2. Required GitHub Secrets
++
++Go to your fork → **Settings → Secrets and variables → Actions** and add:
++
++| Secret               | Description                                              |
++|-----------------------|-----------------------------------------------------------|
++| `OCI_USER_ID`         | OCID of the OCI user (`ocid1.user.oc1..xxx`)              |
++| `OCI_PRIVATE_KEY`     | Full contents of the API signing private key (PEM)        |
++| `OCI_FINGERPRINT`     | Fingerprint of that API key                                |
++| `OCI_TENANCY_ID`      | OCID of your tenancy                                       |
++| `OCI_REGION`          | e.g. `us-phoenix-1`                                        |
++| `OCI_SUBNET_ID`       | OCID of the subnet to attach the instance to                |
++| `OCI_IMAGE_ID`        | OCID of the image (see above; must match your region)       |
++| `OCI_PUBLIC_SSH_KEY`  | Your SSH **public** key, e.g. `ssh-ed25519 AAAA...`          |
++
++See `.env.example` for the equivalent local-testing format (copy to `.env`, never commit it).
++
++### 3. Enable the workflow
++
++Push to your fork's `main` branch (or run it manually from the **Actions** tab via `workflow_dispatch`).
++GitHub Actions schedules can lag under load — a "every 5 minutes" cron is a best-effort floor, not a guarantee.
++
++### 4. After the instance launches
++
++SSH in with your private key:
++
++```bash
++ssh -i /path/to/private_key ubuntu@<public_ip>
++```
++
++Get the public IP from the OCI Console (**Compute → Instances**) or via the CLI/SDK.
++
++---
++
++## Safety notes
++
++- The bot is idempotent per `display_name` — running the schedule indefinitely will not create duplicate
++  instances as long as the `concurrency` block in the workflow stays in place.
++- If you fork this and change the schedule interval, adjust `OCI_MAX_ATTEMPTS` /
++  `OCI_RETRY_DELAY_SECONDS` (env vars, see `.env.example`) so one run finishes before the next is due.
++- Always Free A1 quota is capped at 4 OCPU / 24 GB **total** per tenancy — this bot requests the full
++  allotment in a single instance, so don't run a second copy of this bot against the same tenancy.
+diff --git a/requirements.txt b/requirements.txt
+index 288ff5b..f7107a8 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,2 +1,2 @@
+-oci
+-python-dotenv
++oci>=2.170.0,<3.0.0
++python-dotenv>=1.0.0,<2.0.0

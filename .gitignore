@@ -1,0 +1,12 @@
+# Secrets / local config — NEVER commit real credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

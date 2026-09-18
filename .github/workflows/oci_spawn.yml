@@ -4,9 +4,23 @@ on:
     - cron: '*/5 * * * *'  # Runs every 5 minutes automatically
   workflow_dispatch:       # Allows manual execution triggers
 
+# CRITICAL: without this, a run that takes longer than 5 minutes overlaps
+# with the next scheduled trigger. Multiple concurrent runs hammer the OCI
+# API in parallel and, in the rare case two succeed near-simultaneously,
+# can launch more than one A1.Flex instance and blow past the Always Free
+# quota. `cancel-in-progress: false` means new triggers QUEUE instead of
+# running in parallel — at most one bot.py process runs at a time.
+concurrency:
+  group: oci-provisioner
+  cancel-in-progress: false
+
+permissions:
+  contents: read   # this workflow only reads the repo; no write access needed
+
 jobs:
   attempt-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10   # safety net in case the OCI SDK ever hangs
     steps:
       - name: Check out repository code
         uses: actions/checkout@v4
